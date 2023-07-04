@@ -1,0 +1,229 @@
+version: '3.8'
+services:
+  mariadb:
+    image: mariadb:10.11
+    environment:
+      - MYSQL_DATABASE=passbolt
+      - MYSQL_USER=passbolt
+      - MYSQL_PASSWORD_FILE=/run/secrets/mysqlpassword
+      - MYSQL_ROOT_PASSWORD_FILE=/run/secrets/mysqlrootpassword
+      - MARIADB_AUTO_UPGRADE=1
+    secrets:
+      - source: mysqlpassword
+        target: mysqlpassword
+        mode: 0400
+      - source: mysqlrootpassword
+        target: mysqlrootpassword
+        mode: 0400
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    networks:
+      passbolt_network:
+        aliases:
+          - mariadb.local
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.hetzner_location == nbg1
+
+  passbolt:
+    image: passbolt/passbolt:4.0.2-2-ce
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -a
+        source /run/secrets/passbolt_secret_env
+        exec /usr/bin/wait-for.sh -t 0 mariadb.local:3306 -- /docker-entrypoint.sh
+    environment:
+      DATASOURCES_DEFAULT_HOST: "mariadb.local"
+      DATASOURCES_DEFAULT_USERNAME: "passbolt"
+      DATASOURCES_DEFAULT_DATABASE: "passbolt"
+
+      DATASOURCES_DEFAULT_PASSWORD_FILE: /run/secrets/mysqlpassword
+
+      PASSBOLT_GPG_SERVER_KEY_PRIVATE_FILE: /run/secrets/passbolt_serverkey_private_asc
+      PASSBOLT_GPG_SERVER_KEY_PUBLIC_FILE: /run/secrets/passbolt_serverkey_asc
+
+      APP_FULL_BASE_URL: "https://{{ passbolt_domain }}"
+      
+      PASSBOLT_KEY_LENGTH: "{{ passbolt_key_length | default('4096') }}"
+      PASSBOLT_SUBKEY_LENGTH: "{{ passbolt_subkey_length | default('4096') }}"
+      PASSBOLT_KEY_NAME: "{{ passbolt_key_name | default('admin') }}"
+      PASSBOLT_KEY_EMAIL: "{{ passbolt_key_email | default('none@localhost') }}"
+      PASSBOLT_KEY_EXPIRATION: "{{ passbolt_key_expiration | default('0') }}"
+      EMAIL_TRANSPORT_DEFAULT_CLASS_NAME: "{{ email_transport_default_class_name | default('Smtp') }}"
+      EMAIL_DEFAULT_FROM: "{{ email_default_from }}"
+      EMAIL_DEFAULT_TRANSPORT: "{{ email_default_transport | default('default') }}"
+      EMAIL_TRANSPORT_DEFAULT_HOST: "{{ email_transport_default_host }}"
+      EMAIL_TRANSPORT_DEFAULT_PORT: "{{ email_transport_default_port | default('587') }}"
+      EMAIL_TRANSPORT_DEFAULT_TIMEOUT: "{{ email_transport_default_timeout | default('30') }}"
+      EMAIL_TRANSPORT_DEFAULT_USERNAME: "{{ email_transport_default_username }}"
+      EMAIL_TRANSPORT_DEFAULT_TLS: "{{ email_transport_default_tls | default('true') }}"
+
+      PASSBOLT_EMAIL_SHOW_COMMENT: "{{ passbolt_email_show_comment | default('false') }}"
+      PASSBOLT_EMAIL_SHOW_DESCRIPTION: "{{ passbolt_email_show_description | default('false') }}"
+      PASSBOLT_EMAIL_SHOW_SECRET: "{{ passbolt_email_show_secret | default('false') }}"
+      PASSBOLT_EMAIL_SHOW_URI: "{{ passbolt_email_show_uri | default('false') }}"
+      PASSBOLT_EMAIL_SHOW_USERNAME: "{{ passbolt_email_show_username | default('false') }}"
+      PASSBOLT_PLUGINS_JWT_AUTHENTICATION_ENABLED: "{{ passbolt_plugins_jwt_authentication_enabled | default('true') }}"
+      PASSBOLT_PLUGINS_MOBILE_ENABLED: "{{ passbolt_plugins_mobile_enabled | default('true') }}"
+    volumes: 
+      # we only need jwt in a volume, but this does not need to be backed up
+      # gpg is solved by a pregenerated one
+      # images are stored in db
+      - passbolt_jwt:/etc/passbolt/jwt
+    networks:
+      - passbolt_network
+      - traefik-public
+    secrets:
+      - source: passbolt_secret_env
+        target: passbolt_secret_env
+        uid: '33'
+        gid: '33'
+        mode: 0400
+      - source: mysqlpassword
+        target: mysqlpassword
+        uid: '33'
+        gid: '33'
+        mode: 0400
+      - source: passbolt_serverkey_private_asc
+        target: passbolt_serverkey_private_asc
+        uid: '33'
+        gid: '33'
+        mode: 0400
+      - source: passbolt_serverkey_asc
+        target: passbolt_serverkey_asc
+        uid: '33'
+        gid: '33'
+        mode: 0400
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints: 
+          - node.labels.hetzner_location == nbg1
+      
+      labels:
+        - "traefik.docker.network=traefik-public"
+
+        - "traefik.enable=true"
+        - "traefik.http.routers.{{ stack_name }}.rule=Host(`{{ passbolt_domain }}`)"
+        - "traefik.http.routers.{{ stack_name }}.entrypoints=http"
+
+        - "traefik.http.services.{{ stack_name }}.loadbalancer.server.scheme=http"
+        - "traefik.http.services.{{ stack_name }}.loadbalancer.server.port=80"
+
+        - "traefik.http.routers.{{ stack_name }}.service={{ stack_name }}"
+
+        - "traefik.http.routers.{{ stack_name }}.middlewares={{ stack_name }}-headers"
+        - "traefik.http.middlewares.{{ stack_name }}-headers.headers.customrequestheaders.X-Real-IP="
+        - "traefik.http.middlewares.{{ stack_name }}-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+
+        - "traefik.constraint-label=traefik-public"
+
+{% if include_backup | default(True) %}
+  mariadb_backup:
+    image: neuroforgede/mariadb_dump:10.11
+    command: sh -c "cd /home/user && exec bash mysql_dump.sh"
+    deploy:
+      restart_policy:
+        # hourly
+        delay: 3600s
+      
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    environment:
+      MYSQL_HOST: mariadb.local
+      MYSQL_DB: passbolt
+      MYSQL_USER: passbolt
+
+      SFTP_USER: "{{ mariadb_backup_sftp_user }}"
+      SFTP_TARGET: "{{ mariadb_sftp_target_sftp_user }}"
+      SFTP_BASE_PATH: "{{ mariadb_sftp_base_path }}"
+
+      # 336 hours = last 2 weeks
+      KEEP_LAST_N_DUMPS: "{{ mariadb_keep_last_n_dumps | default('336') }}"
+    
+    secrets:
+      - source: storagebox_mysql_dump_password
+        target: storagebox_password
+        uid: '1000'
+        gid: '1000'
+        mode: 0400
+
+      - source: mysqlpassword
+        target: mysql_mysqldump_mysqlpassword
+        uid: '1000'
+        gid: '1000'
+        mode: 0400
+
+    configs:
+      - source: storagebox_knownhosts
+        target: /home/user/.ssh/known_hosts
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    
+      - source: mysql_mysqldump_script
+        target: /home/user/mysql_dump.sh
+        uid: "1000"
+        gid: "1000"
+        mode: 0500
+
+    networks:
+      - passbolt_network
+{% endif %}
+
+networks:
+  passbolt_network:
+    driver: overlay
+    attachable: true
+    driver_opts:
+      encrypted: ""
+      com.docker.network.driver.mtu: "1350"
+  traefik-public:
+    external: true
+
+volumes:
+  mariadb_data:
+    driver: hetzner-volume
+    driver_opts:
+      size: '10'
+      fstype: ext4
+  passbolt_jwt:
+    driver: hetzner-volume
+    driver_opts:
+      size: '10'
+      fstype: ext4
+      uid: '33'
+      gid: '33'
+
+secrets:
+  storagebox_mysql_dump_password:
+    file: ./secrets/mysql_dump/sshpassword
+
+  mysqlpassword:
+    file: ./secrets/mysql/mysqlpassword
+  mysqlrootpassword:
+    file: ./secrets/mysql/mysqlrootpassword
+
+  passbolt_secret_env:
+    file: ./secrets/passbolt/passbolt_secret_env
+  passbolt_serverkey_asc:
+    file: ./secrets/passbolt/gpg/serverkey.asc
+  passbolt_serverkey_private_asc:
+    file: ./secrets/passbolt/gpg/serverkey_private.asc
+
+configs:
+  storagebox_knownhosts:
+    file: ./configs/mysql_dump/known_hosts
+  mysql_mysqldump_script:
+    file: ./configs/mysql_dump/mysql_dump.sh
